@@ -193,6 +193,11 @@ type OpenCodeSubscribedEvent =
     ? TEvent
     : never;
 
+interface OpenCodeTaskHydration {
+  active: boolean;
+  readonly bufferedEvents: Array<OpenCodeSubscribedEvent>;
+}
+
 function trimText(value: string | undefined | null): string | undefined {
   const trimmed = value?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
@@ -251,6 +256,7 @@ interface OpenCodeSessionContext {
   readonly partById: Map<string, Part>;
   readonly taskLifecycleByPartId: Map<string, OpenCodeTaskLifecycle>;
   readonly taskLifecycleByTaskId: Map<RuntimeTaskId, OpenCodeTaskLifecycle>;
+  readonly taskHydration: OpenCodeTaskHydration;
   readonly emittedTextByPartId: Map<string, string>;
   readonly completedAssistantPartIds: Set<string>;
   readonly turns: Array<OpenCodeTurnSnapshot>;
@@ -604,26 +610,41 @@ function taskLifecycleFromPart(
   };
 }
 
-function taskNotificationsFromPart(part: Part): ReadonlyArray<OpenCodeTaskNotification> {
-  if (part.type !== "text" || part.synthetic !== true) {
-    return [];
+const OPENCODE_TASK_ENVELOPE_PATTERN =
+  /^<task id="([^"]+)" state="(completed|error)">(?:\r?\n)?(?:<summary>[\s\S]*?<\/summary>(?:\r?\n)?)?<(task_result|task_error)>(?:\r?\n)?([\s\S]*)(?:\r?\n)?<\/\3>(?:\r?\n)?<\/task>$/;
+
+function taskNotificationFromText(text: string): OpenCodeTaskNotification | undefined {
+  const match = OPENCODE_TASK_ENVELOPE_PATTERN.exec(text);
+  const taskId = trimText(match?.[1]);
+  if (!match || !taskId) {
+    return undefined;
   }
 
-  const notifications: Array<OpenCodeTaskNotification> = [];
-  const pattern =
-    /<task id="([^"]+)" state="(completed|error)">[\s\S]*?<(task_result|task_error)>\s*([\s\S]*?)\s*<\/\3>[\s\S]*?<\/task>/g;
-  for (const match of part.text.matchAll(pattern)) {
-    const taskId = trimText(match[1]);
-    if (!taskId) {
-      continue;
-    }
-    notifications.push({
-      taskId: RuntimeTaskId.make(taskId),
-      status: match[2] === "error" ? "failed" : "completed",
-      summary: trimText(match[4]),
-    });
+  const status = match[2] === "error" ? "failed" : "completed";
+  if (
+    (status === "completed" && match[3] !== "task_result") ||
+    (status === "failed" && match[3] !== "task_error")
+  ) {
+    return undefined;
   }
-  return notifications;
+
+  return {
+    taskId: RuntimeTaskId.make(taskId),
+    status,
+    summary: trimText(match[4]),
+  };
+}
+
+function taskSummaryFromOutput(output: string): string | undefined {
+  return taskNotificationFromText(output)?.summary ?? trimText(output);
+}
+
+function taskNotificationsFromPart(part: Part): ReadonlyArray<OpenCodeTaskNotification> {
+  const notification =
+    part.type === "text" && part.synthetic === true
+      ? taskNotificationFromText(part.text)
+      : undefined;
+  return notification ? [notification] : [];
 }
 
 function taskLinkage(task: OpenCodeTaskLifecycle) {
@@ -946,12 +967,167 @@ export function makeOpenCodeAdapter(
       task.status = notification.status;
     });
 
+    const reconcileTaskToolPart = Effect.fn("reconcileTaskToolPart")(function* (
+      context: OpenCodeSessionContext,
+      part: Extract<Part, { type: "tool" }>,
+      turnId: TurnId | undefined,
+      raw: unknown,
+      options?: { readonly backgroundOnly?: boolean },
+    ) {
+      if (options?.backgroundOnly) {
+        if (part.state.status === "pending" || part.state.metadata?.["background"] !== true) {
+          return;
+        }
+      }
+
+      const previousTask = context.taskLifecycleByPartId.get(part.id);
+      const taskFromPart = taskLifecycleFromPart(part, previousTask);
+      const existingTask =
+        taskFromPart === undefined
+          ? undefined
+          : context.taskLifecycleByTaskId.get(taskFromPart.taskId);
+      const reactivating =
+        taskFromPart !== undefined &&
+        previousTask === undefined &&
+        taskFromPart.resumed &&
+        existingTask !== undefined &&
+        (existingTask.status === "completed" || existingTask.status === "failed") &&
+        existingTask.toolUseId !== part.callID;
+      const task =
+        taskFromPart === undefined
+          ? undefined
+          : reactivating
+            ? taskFromPart
+            : (existingTask ?? taskFromPart);
+      const taskRemainsRunning =
+        part.state.status === "completed" && part.state.metadata["background"] === true;
+      const nextTaskStatus =
+        part.state.status === "error"
+          ? "failed"
+          : taskRemainsRunning
+            ? "running"
+            : part.state.status;
+      if (task && task.status !== nextTaskStatus) {
+        const linkage = taskLinkage(task);
+        if (task.status === undefined && !reactivating) {
+          yield* emit({
+            ...(yield* buildEventBase({
+              threadId: context.session.threadId,
+              turnId,
+              itemId: part.callID,
+              createdAt:
+                part.state.status === "pending" ? undefined : isoFromEpochMs(part.state.time.start),
+              raw,
+            })),
+            type: "task.started",
+            payload: {
+              taskId: task.taskId,
+              ...(task.description ? { description: task.description } : {}),
+              ...linkage,
+            },
+          });
+        }
+        if (task.status === undefined && (task.resumed || reactivating)) {
+          yield* emit({
+            ...(yield* buildEventBase({
+              threadId: context.session.threadId,
+              turnId,
+              itemId: part.callID,
+              createdAt:
+                part.state.status === "pending" ? undefined : isoFromEpochMs(part.state.time.start),
+              raw,
+            })),
+            type: "task.updated",
+            payload: {
+              taskId: task.taskId,
+              status: "running",
+              ...(task.description ? { description: task.description } : {}),
+              ...linkage,
+            },
+          });
+        }
+        if (task.status === undefined) {
+          task.status = "running";
+        }
+
+        if (
+          !taskRemainsRunning &&
+          (part.state.status === "completed" || part.state.status === "error")
+        ) {
+          const failed = part.state.status === "error";
+          const summary =
+            part.state.status === "error"
+              ? trimText(part.state.error)
+              : taskSummaryFromOutput(part.state.output);
+          yield* emit({
+            ...(yield* buildEventBase({
+              threadId: context.session.threadId,
+              turnId,
+              itemId: part.callID,
+              createdAt: isoFromEpochMs(part.state.time.end),
+              raw,
+            })),
+            type: "task.completed",
+            payload: {
+              taskId: task.taskId,
+              status: failed ? "failed" : "completed",
+              ...(summary ? { summary } : {}),
+              ...linkage,
+            },
+          });
+          task.status = failed ? "failed" : "completed";
+        }
+      }
+      if (task) {
+        context.taskLifecycleByPartId.set(part.id, task);
+        context.taskLifecycleByTaskId.set(task.taskId, task);
+      }
+    });
+
+    const hydrateReusedTaskHistory = Effect.fn("hydrateReusedTaskHistory")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      const messages = yield* runOpenCodeSdk("session.messages", () =>
+        context.client.session.messages({ sessionID: context.openCodeSessionId }),
+      );
+      for (const entry of messages.data ?? []) {
+        for (const part of entry.parts) {
+          // Replaying foreground history would duplicate root-chat rows. Only
+          // seed tool lifecycle from assistant parent messages, while allowing
+          // synthetic terminal notices from their real user-message shape.
+          if (entry.info.role === "assistant" && part.type === "tool") {
+            yield* reconcileTaskToolPart(context, part, undefined, part, {
+              backgroundOnly: true,
+            });
+          }
+          for (const notification of taskNotificationsFromPart(part)) {
+            yield* emitTaskNotification(context, notification, undefined, part);
+          }
+        }
+      }
+    });
+
+    const isTaskLifecycleEvent = (event: OpenCodeSubscribedEvent): boolean =>
+      event.type === "message.part.updated" &&
+      (event.properties.part.type === "tool"
+        ? event.properties.part.tool.toLowerCase() === "task"
+        : taskNotificationsFromPart(event.properties.part).length > 0);
+
     const handleSubscribedEvent = Effect.fn("handleSubscribedEvent")(function* (
       context: OpenCodeSessionContext,
       event: OpenCodeSubscribedEvent,
+      options?: { readonly bypassTaskHydration?: boolean },
     ) {
       const payloadSessionId = openCodeEventSessionId(event);
       if (payloadSessionId !== context.openCodeSessionId) {
+        return;
+      }
+      if (
+        !options?.bypassTaskHydration &&
+        context.taskHydration.active &&
+        isTaskLifecycleEvent(event)
+      ) {
+        context.taskHydration.bufferedEvents.push(event);
         return;
       }
 
@@ -1102,93 +1278,7 @@ export function makeOpenCodeAdapter(
             };
             appendTurnItem(context, turnId, part);
             yield* emit(runtimeEvent);
-
-            const previousTask = context.taskLifecycleByPartId.get(part.id);
-            const task = taskLifecycleFromPart(part, previousTask);
-            const taskRemainsRunning =
-              part.state.status === "completed" && part.state.metadata["background"] === true;
-            const nextTaskStatus =
-              part.state.status === "error"
-                ? "failed"
-                : taskRemainsRunning
-                  ? "running"
-                  : part.state.status;
-            if (task && task.status !== nextTaskStatus) {
-              const linkage = taskLinkage(task);
-              if (task.status === undefined) {
-                yield* emit({
-                  ...(yield* buildEventBase({
-                    threadId: context.session.threadId,
-                    turnId,
-                    itemId: part.callID,
-                    createdAt:
-                      part.state.status === "pending"
-                        ? undefined
-                        : isoFromEpochMs(part.state.time.start),
-                    raw: event,
-                  })),
-                  type: "task.started",
-                  payload: {
-                    taskId: task.taskId,
-                    ...(task.description ? { description: task.description } : {}),
-                    ...linkage,
-                  },
-                });
-                if (task.resumed) {
-                  yield* emit({
-                    ...(yield* buildEventBase({
-                      threadId: context.session.threadId,
-                      turnId,
-                      itemId: part.callID,
-                      createdAt:
-                        part.state.status === "pending"
-                          ? undefined
-                          : isoFromEpochMs(part.state.time.start),
-                      raw: event,
-                    })),
-                    type: "task.updated",
-                    payload: {
-                      taskId: task.taskId,
-                      status: "running",
-                      ...(task.description ? { description: task.description } : {}),
-                      ...linkage,
-                    },
-                  });
-                }
-                task.status = "running";
-              }
-
-              if (
-                !taskRemainsRunning &&
-                (part.state.status === "completed" || part.state.status === "error")
-              ) {
-                const failed = part.state.status === "error";
-                const summary = trimText(
-                  part.state.status === "error" ? part.state.error : part.state.output,
-                );
-                yield* emit({
-                  ...(yield* buildEventBase({
-                    threadId: context.session.threadId,
-                    turnId,
-                    itemId: part.callID,
-                    createdAt: isoFromEpochMs(part.state.time.end),
-                    raw: event,
-                  })),
-                  type: "task.completed",
-                  payload: {
-                    taskId: task.taskId,
-                    status: failed ? "failed" : "completed",
-                    ...(summary ? { summary } : {}),
-                    ...linkage,
-                  },
-                });
-                task.status = failed ? "failed" : "completed";
-              }
-            }
-            if (task) {
-              context.taskLifecycleByPartId.set(part.id, task);
-              context.taskLifecycleByTaskId.set(task.taskId, task);
-            }
+            yield* reconcileTaskToolPart(context, part, turnId, event);
           }
           break;
         }
@@ -1375,6 +1465,18 @@ export function makeOpenCodeAdapter(
       }
     });
 
+    const drainTaskHydration = Effect.fn("drainTaskHydration")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      while (context.taskHydration.bufferedEvents.length > 0) {
+        const bufferedEvents = context.taskHydration.bufferedEvents.splice(0);
+        for (const event of bufferedEvents) {
+          yield* handleSubscribedEvent(context, event, { bypassTaskHydration: true });
+        }
+      }
+      context.taskHydration.active = false;
+    });
+
     const startEventPump = Effect.fn("startEventPump")(function* (context: OpenCodeSessionContext) {
       // One AbortController per session scope. The finalizer fires when
       // the scope closes (explicit stop, unexpected exit, or layer
@@ -1386,25 +1488,27 @@ export function makeOpenCodeAdapter(
         Effect.sync(() => eventsAbortController.abort()),
       );
 
+      // Establish the subscription before callers start any history replay.
+      // The stream itself remains scope-owned below, but this closes the gap
+      // where a background completion could arrive between snapshot and subscribe.
+      const subscription = yield* runOpenCodeSdk("event.subscribe", () =>
+        context.client.event.subscribe(undefined, {
+          signal: eventsAbortController.signal,
+        }),
+      );
+
       // Fibers forked into `context.sessionScope` are interrupted
       // automatically when the scope closes — no bookkeeping required.
-      yield* Effect.flatMap(
-        runOpenCodeSdk("event.subscribe", () =>
-          context.client.event.subscribe(undefined, {
-            signal: eventsAbortController.signal,
+      yield* Stream.fromAsyncIterable(
+        subscription.stream,
+        (cause) =>
+          new OpenCodeRuntimeError({
+            operation: "event.subscribe",
+            detail: openCodeRuntimeErrorDetail(cause),
+            cause,
           }),
-        ),
-        (subscription) =>
-          Stream.fromAsyncIterable(
-            subscription.stream,
-            (cause) =>
-              new OpenCodeRuntimeError({
-                operation: "event.subscribe",
-                detail: openCodeRuntimeErrorDetail(cause),
-                cause,
-              }),
-          ).pipe(Stream.runForEach((event) => handleSubscribedEvent(context, event))),
       ).pipe(
+        Stream.runForEach((event) => handleSubscribedEvent(context, event)),
         Effect.exit,
         Effect.flatMap((exit) =>
           Effect.gen(function* () {
@@ -1520,7 +1624,7 @@ export function makeOpenCodeAdapter(
                       permission: buildOpenCodePermissionRules(input.runtimeMode),
                     }),
                   );
-                  return { openCodeSession: reusable, created: false };
+                  return { openCodeSession: reusable, created: false, reused: true };
                 }
 
                 // The session lives under a different cwd (e.g. the thread
@@ -1547,7 +1651,7 @@ export function makeOpenCodeAdapter(
                       permission: buildOpenCodePermissionRules(input.runtimeMode),
                     }),
                   );
-                  return { openCodeSession: forked, created: true };
+                  return { openCodeSession: forked, created: true, reused: false };
                 }
 
                 if (resumeSessionId) {
@@ -1567,7 +1671,7 @@ export function makeOpenCodeAdapter(
                     detail: "OpenCode session.create returned no session payload.",
                   });
                 }
-                return { openCodeSession: createdSession.data, created: true };
+                return { openCodeSession: createdSession.data, created: true, reused: false };
               });
 
               return {
@@ -1576,6 +1680,7 @@ export function makeOpenCodeAdapter(
                 client,
                 openCodeSession: resolved.openCodeSession,
                 created: resolved.created,
+                reused: resolved.reused,
               };
             }).pipe(Effect.provideService(Scope.Scope, sessionScope)),
           );
@@ -1635,6 +1740,10 @@ export function makeOpenCodeAdapter(
           partById: new Map(),
           taskLifecycleByPartId: new Map(),
           taskLifecycleByTaskId: new Map(),
+          taskHydration: {
+            active: started.reused,
+            bufferedEvents: [],
+          },
           emittedTextByPartId: new Map(),
           messageRoleById: new Map(),
           completedAssistantPartIds: new Set(),
@@ -1646,7 +1755,6 @@ export function makeOpenCodeAdapter(
           sessionScope: started.sessionScope,
         };
         sessions.set(input.threadId, context);
-        yield* startEventPump(context);
 
         yield* emit({
           ...(yield* buildEventBase({ threadId: input.threadId })),
@@ -1662,6 +1770,23 @@ export function makeOpenCodeAdapter(
             providerThreadId: started.openCodeSession.id,
           },
         });
+        const eventPumpExit = yield* Effect.exit(startEventPump(context));
+        if (Exit.isFailure(eventPumpExit)) {
+          const cause = Cause.squash(eventPumpExit.cause);
+          yield* emitUnexpectedExit(context, openCodeRuntimeErrorDetail(cause));
+          return yield* toProcessError(input.threadId, cause);
+        }
+        if (started.reused) {
+          const hydrationExit = yield* Effect.exit(hydrateReusedTaskHistory(context));
+          yield* drainTaskHydration(context);
+          if (Exit.isFailure(hydrationExit)) {
+            yield* Effect.logWarning(
+              `OpenCode task history hydration failed: ${openCodeRuntimeErrorDetail(
+                Cause.squash(hydrationExit.cause),
+              )}`,
+            );
+          }
+        }
 
         return session;
       },
