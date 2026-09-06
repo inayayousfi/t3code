@@ -7976,6 +7976,74 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("announces restored running Tasks once when their live parts replay", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-task-restored-replay");
+      const parts = [false, true].map((background) =>
+        taskPart({
+          id: `restored-${background}`,
+          taskId: `task-restored-${background}`,
+          description: "Restored child",
+          role: "explore",
+          status: background ? "completed" : "running",
+          background,
+        }),
+      );
+      runtimeMock.state.messages = parts.map((part) =>
+        messageEntry(part.messageID, "assistant", part),
+      );
+      runtimeMock.state.subscribedEvents = [
+        ...parts.flatMap((part) => [partUpdated(part), partUpdated(part)]),
+        partUpdated({
+          id: "restored-sentinel",
+          sessionID: OPEN_CODE_SESSION_ID,
+          messageID: "msg-restored-sentinel",
+          type: "tool",
+          callID: "call-restored-sentinel",
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: {},
+            title: "Done",
+            output: "",
+            metadata: {},
+            time: { start: 2, end: 3 },
+          },
+        }),
+      ];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil(
+          (event) =>
+            event.type === "item.completed" && String(event.itemId) === "call-restored-sentinel",
+        ),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId: OPEN_CODE_SESSION_ID },
+      });
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      NodeAssert.deepEqual(
+        events
+          .filter((event) => event.type === "task.updated")
+          .map((event) => {
+            NodeAssert.ok(event.type === "task.updated");
+            return [event.payload.taskId, event.payload.status];
+          }),
+        [
+          ["task-restored-false", "running"],
+          ["task-restored-true", "running"],
+        ],
+      );
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("stops restored running and background Tasks without a live replay", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

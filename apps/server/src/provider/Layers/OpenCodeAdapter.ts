@@ -1994,51 +1994,51 @@ export function makeOpenCodeAdapter(
           previousTask !== undefined &&
           previousTask.toolUseId === undefined &&
           isTerminalOpenCodeTaskStatus(previousTask.status);
-        if (!previousTask || completedBeforeStart || task.status !== "running") {
-          const taskEventBaseInput = {
-            threadId: context.session.threadId,
-            turnId,
-            itemId: part.callID,
-            createdAt: isoFromEpochMs(part.state.time.start),
-            raw,
-          };
-          const startedBase = yield* buildEventBase(taskEventBaseInput);
-          yield* emit(
-            previousTask && !completedBeforeStart
-              ? {
-                  ...startedBase,
-                  type: "task.updated",
-                  payload: {
-                    taskId: task.taskId,
-                    status: "running",
-                    ...(task.description ? { description: task.description } : {}),
-                    ...linkage,
-                  },
-                }
-              : {
-                  ...startedBase,
-                  type: "task.started",
-                  payload: {
-                    taskId: task.taskId,
-                    ...(task.description ? { description: task.description } : {}),
-                    ...linkage,
-                  },
+        // Stored history establishes status for Stop, but its running tasks
+        // have not yet been announced by this connection's live stream.
+        const taskEventBaseInput = {
+          threadId: context.session.threadId,
+          turnId,
+          itemId: part.callID,
+          createdAt: isoFromEpochMs(part.state.time.start),
+          raw,
+        };
+        const startedBase = yield* buildEventBase(taskEventBaseInput);
+        yield* emit(
+          previousTask && !completedBeforeStart
+            ? {
+                ...startedBase,
+                type: "task.updated",
+                payload: {
+                  taskId: task.taskId,
+                  status: "running",
+                  ...(task.description ? { description: task.description } : {}),
+                  ...linkage,
                 },
-          );
-          if (!previousTask && typeof part.state.input["task_id"] === "string") {
-            // Resuming a child this session never saw: the row starts, then
-            // reads as a continuation rather than a first run.
-            yield* emit({
-              ...(yield* buildEventBase(taskEventBaseInput)),
-              type: "task.updated",
-              payload: {
-                taskId: task.taskId,
-                status: "running",
-                ...(task.description ? { description: task.description } : {}),
-                ...linkage,
+              }
+            : {
+                ...startedBase,
+                type: "task.started",
+                payload: {
+                  taskId: task.taskId,
+                  ...(task.description ? { description: task.description } : {}),
+                  ...linkage,
+                },
               },
-            });
-          }
+        );
+        if (!previousTask && typeof part.state.input["task_id"] === "string") {
+          // Resuming a child this session never saw: the row starts, then
+          // reads as a continuation rather than a first run.
+          yield* emit({
+            ...(yield* buildEventBase(taskEventBaseInput)),
+            type: "task.updated",
+            payload: {
+              taskId: task.taskId,
+              status: "running",
+              ...(task.description ? { description: task.description } : {}),
+              ...linkage,
+            },
+          });
         }
         if (!completedBeforeStart) {
           task.status = "running";
