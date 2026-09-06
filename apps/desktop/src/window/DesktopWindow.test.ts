@@ -80,6 +80,7 @@ function makeFakeBrowserWindow() {
     reload: vi.fn(),
     replaceMisspelling: vi.fn(),
     send: vi.fn(),
+    setBackgroundThrottling: vi.fn(),
     setWindowOpenHandler: vi.fn(),
   };
 
@@ -104,6 +105,8 @@ function makeFakeBrowserWindow() {
     restore: vi.fn(),
     setBackgroundColor: vi.fn(),
     setAutoHideCursor: vi.fn(),
+    setFullScreen: vi.fn(),
+    setOpacity: vi.fn(),
     setTitle: vi.fn(),
     setTitleBarOverlay: vi.fn(),
     show: vi.fn(),
@@ -124,7 +127,10 @@ function makeFakeBrowserWindow() {
     reload: webContents.reload,
     send: webContents.send,
     setZoomLevel: webContents.setZoomLevel,
+    setBackgroundThrottling: webContents.setBackgroundThrottling,
     setAutoHideCursor: window.setAutoHideCursor,
+    setFullScreen: window.setFullScreen,
+    setOpacity: window.setOpacity,
     webContentsListeners,
     windowListeners,
   };
@@ -274,6 +280,7 @@ function makeTestLayer(input: {
               input.openedExternalUrls?.push(url);
               return true;
             }),
+          openSystemSettings: () => Effect.succeed(true),
           copyText: () => Effect.void,
         } satisfies ElectronShell.ElectronShell["Service"]),
         electronThemeLayer,
@@ -374,6 +381,7 @@ const makeSplashScenario = (createOutcomes: readonly (Electron.BrowserWindow | n
           electronMenuLayer,
           Layer.succeed(ElectronShell.ElectronShell, {
             openExternal: () => Effect.succeed(true),
+            openSystemSettings: () => Effect.succeed(true),
             copyText: () => Effect.void,
           } satisfies ElectronShell.ElectronShell["Service"]),
           electronThemeLayer,
@@ -392,6 +400,25 @@ const makeSplashScenario = (createOutcomes: readonly (Electron.BrowserWindow | n
   });
 
 describe("DesktopWindow", () => {
+  it("leaves fullscreen before concealing a pending quit", () => {
+    const fakeWindow = makeFakeBrowserWindow();
+
+    DesktopWindow.concealPendingQuitWindow(fakeWindow.window);
+    assert.deepEqual(fakeWindow.setOpacity.mock.calls, [[0]]);
+
+    fakeWindow.setOpacity.mockClear();
+    fakeWindow.isFullScreen.mockReturnValue(true);
+    DesktopWindow.concealPendingQuitWindow(fakeWindow.window);
+    assert.deepEqual(fakeWindow.setFullScreen.mock.calls, [[false]]);
+    assert.deepEqual(fakeWindow.setOpacity.mock.calls, [[0]]);
+
+    fakeWindow.setOpacity.mockClear();
+    fakeWindow.isFullScreen.mockReturnValue(false);
+    fakeWindow.isDestroyed.mockReturnValue(true);
+    DesktopWindow.concealPendingQuitWindow(fakeWindow.window);
+    assert.equal(fakeWindow.setOpacity.mock.calls.length, 0);
+  });
+
   it("restores bounds only when the window fits within a connected display", () => {
     const persistedBounds = { x: 2040, y: 80, width: 1320, height: 880 };
     const displays = [
@@ -600,6 +627,35 @@ describe("DesktopWindow", () => {
         }
         readyToShow();
         assert.equal(fakeWindow.maximize.mock.calls.length, 1);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  // The window boots hidden with throttling disabled so first paint runs at
+  // full speed; the first reveal must hand it back to normal hidden-window
+  // throttling or a minimized window stays expensive forever.
+  it.effect("re-enables background throttling on first reveal", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = makeTestLayer({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+
+        assert.equal(fakeWindow.setBackgroundThrottling.mock.calls.length, 0);
+        const readyToShow = fakeWindow.windowListeners.get("ready-to-show");
+        if (!readyToShow) {
+          return yield* Effect.die("window ready-to-show listener was not registered");
+        }
+        readyToShow();
+        assert.deepEqual(fakeWindow.setBackgroundThrottling.mock.calls, [[true]]);
       }).pipe(Effect.provide(layer));
     }),
   );
