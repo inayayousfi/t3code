@@ -11,7 +11,7 @@ import {
   type NativeStackNavigationOptions,
 } from "@react-navigation/native-stack";
 import { useEffect, useRef } from "react";
-import { Platform, Pressable, ScrollView, StyleSheet } from "react-native";
+import { Platform, Pressable, ScrollView, StyleSheet, View } from "react-native";
 import { useResolveClassNames } from "uniwind";
 
 import { AppText as Text } from "./components/AppText";
@@ -57,6 +57,7 @@ import { SettingsEnvironmentsRouteScreen } from "./features/settings/SettingsEnv
 import { SettingsEnvironmentRenameRouteScreen } from "./features/settings/SettingsEnvironmentRenameRouteScreen";
 import { SettingsLegalRouteScreen } from "./features/settings/SettingsLegalRouteScreen";
 import { SettingsProjectGroupingRouteScreen } from "./features/settings/SettingsProjectGroupingRouteScreen";
+import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
 import { SettingsRouteScreen } from "./features/settings/SettingsRouteScreen";
 import { ShowcaseCaptureCoordinator } from "./features/showcase/ShowcaseCaptureCoordinator";
@@ -72,12 +73,9 @@ import {
 } from "./features/sharing/incoming-share-presentation";
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "./native/native-glass";
 import { nativeHeaderScrollEdgeEffects } from "./native/StackHeader";
-import {
-  FORM_SHEET_PRESENTATION_OPTIONS,
-  NATIVE_SHEET_SURFACE_COLOR,
-  NATIVE_SHEET_SURFACE_CONTENT_STYLE,
-} from "./native/sheet-surface";
+import { FORM_SHEET_PRESENTATION_OPTIONS } from "./native/sheet-surface";
 import { useThreadOutboxDrain } from "./state/use-thread-outbox-drain";
+import { useComposerAttachmentUploadWorker } from "./state/composer-attachment-uploads";
 
 const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
 
@@ -97,11 +95,7 @@ const GLASS_HEADER_OPTIONS: AppScreenOptions = {
   headerLargeTitle: false,
   headerShadowVisible: false,
   headerShown: true,
-  headerStyle: NATIVE_LIQUID_GLASS_SUPPORTED
-    ? { backgroundColor: "transparent" }
-    : NATIVE_SHEET_SURFACE_COLOR !== undefined
-      ? { backgroundColor: NATIVE_SHEET_SURFACE_COLOR as unknown as string }
-      : undefined,
+  headerStyle: NATIVE_LIQUID_GLASS_SUPPORTED ? { backgroundColor: "transparent" } : undefined,
   headerTitleStyle: { fontSize: 18, fontWeight: "800" },
   headerTransparent: NATIVE_LIQUID_GLASS_SUPPORTED,
   scrollEdgeEffects: NATIVE_LIQUID_GLASS_SUPPORTED ? HEADER_SCROLL_EDGE_EFFECTS : undefined,
@@ -116,12 +110,6 @@ const SOLID_HEADER_OPTIONS: AppScreenOptions = {
   headerLargeTitle: false,
   headerShadowVisible: false,
   headerShown: true,
-  headerStyle:
-    NATIVE_SHEET_SURFACE_COLOR !== undefined
-      ? // native-stack types this as `string`, but the native side accepts any
-        // ColorValue including DynamicColorIOS.
-        { backgroundColor: NATIVE_SHEET_SURFACE_COLOR as unknown as string }
-      : undefined,
   headerTitleStyle: { fontSize: 18, fontWeight: "800" },
   headerTransparent: false,
   unstable_navigationItemStyle: Platform.OS === "ios" ? "editor" : undefined,
@@ -205,6 +193,10 @@ const SettingsContentStack = createNativeStackNavigator({
       options: {
         title: "Client Storage",
       },
+    }),
+    SettingsUsageAccount: createNativeStackScreen({
+      screen: UsageLimitAccountScreen,
+      options: { title: "Account" },
     }),
     SettingsUsage: createNativeStackScreen({
       screen: UsageRouteScreen,
@@ -370,6 +362,7 @@ function workspacePathFromState(state: NavigationState): string {
 // each enqueue, shell change, or reconnect.
 function ThreadOutboxDrainWorker() {
   useThreadOutboxDrain();
+  useComposerAttachmentUploadWorker();
   return null;
 }
 
@@ -508,7 +501,6 @@ export const RootStack = createNativeStackNavigator({
       linking: `${THREAD_LINKING_PREFIX}/files`,
       options: {
         ...GLASS_HEADER_OPTIONS,
-        contentStyle: NATIVE_SHEET_SURFACE_CONTENT_STYLE,
         title: "Files",
       },
     }),
@@ -647,7 +639,11 @@ export const RootStack = createNativeStackNavigator({
       // The whole new-task flow (choose project → draft → add project) shares
       // draft state via NewTaskFlowProvider. The expo-router era mounted it in
       // app/new/_layout.tsx; this layout wrapper is the native-stack equivalent.
-      layout: ({ children }) => <NewTaskFlowProvider>{children}</NewTaskFlowProvider>,
+      layout: ({ children }) => (
+        <NewTaskFlowProvider>
+          <View className="flex-1 bg-sheet-solid">{children}</View>
+        </NewTaskFlowProvider>
+      ),
       options: {
         gestureEnabled: true,
         headerShown: false,

@@ -11,6 +11,7 @@ import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
@@ -96,6 +97,32 @@ it.effect("synchronizes the current descriptor label with the relay", () =>
       { label: "Current label", authorization: "Bearer relay-credential" },
     ]);
   }),
+);
+
+it.effect("times out an unresponsive relay so configuration and retries can continue", () =>
+  Effect.gen(function* () {
+    const started = yield* Deferred.make<void>();
+    const completed = yield* Deferred.make<void>();
+    const client = HttpClient.make(() =>
+      Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+    );
+
+    yield* synchronizeCurrentEnvironmentLabelWithRelay().pipe(
+      Effect.provideService(ServerSecretStore.ServerSecretStore, makeSecretStore()),
+      Effect.provideService(ServerEnvironment.ServerEnvironment, {
+        getEnvironmentId: Effect.succeed(environmentId),
+        getDescriptor: Effect.succeed(descriptor("Current label")),
+        setEnvironmentLabel: () => Effect.void,
+      }),
+      Effect.provideService(HttpClient.HttpClient, client),
+      Effect.catchTag("TimeoutError", () => Deferred.succeed(completed, undefined)),
+      Effect.forkScoped,
+    );
+
+    yield* Deferred.await(started);
+    yield* TestClock.adjust("10 seconds");
+    assert.isTrue(yield* Deferred.isDone(completed));
+  }).pipe(Effect.scoped),
 );
 
 it.effect("cancels an older synchronization when a newer label arrives", () =>

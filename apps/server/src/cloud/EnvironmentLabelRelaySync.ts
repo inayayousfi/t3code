@@ -45,10 +45,12 @@ export const synchronizeCurrentEnvironmentLabelWithRelay = Effect.fn(
     baseUrl: relayUrl,
     transformClient: relayEnvironmentClient(environmentCredential),
   });
-  yield* client.server.updateEnvironmentLabel({
-    params: { environmentId: descriptor.environmentId },
-    payload: { label: descriptor.label },
-  });
+  yield* client.server
+    .updateEnvironmentLabel({
+      params: { environmentId: descriptor.environmentId },
+      payload: { label: descriptor.label },
+    })
+    .pipe(Effect.timeout("10 seconds"));
   yield* Effect.logDebug("synchronized environment label with relay", {
     environmentId: descriptor.environmentId,
   });

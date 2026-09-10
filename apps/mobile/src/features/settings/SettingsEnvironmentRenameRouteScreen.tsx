@@ -102,7 +102,7 @@ export function SettingsEnvironmentRenameRouteScreen({
           onPress={() => void save()}
         >
           {saving ? (
-            <ActivityIndicator color="white" />
+            <ActivityIndicator colorClassName="accent-primary-foreground" />
           ) : (
             <Text className="font-t3-bold text-primary-foreground">Save</Text>
           )}

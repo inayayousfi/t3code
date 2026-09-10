@@ -66,6 +66,9 @@ export function eventThreadId(event: OrchestrationEvent): ThreadId | null {
 }
 
 export function shouldPublishAgentAwarenessEvent(event: OrchestrationEvent): boolean {
+  if (event.metadata.historyImport === true) {
+    return false;
+  }
   switch (event.type) {
     case "thread.message-sent":
     case "thread.turn-start-requested":
@@ -99,10 +102,6 @@ export function agentAwarenessPublishIdentity(state: RelayAgentActivityState | n
   }
   const { updatedAt: _updatedAt, ...meaningfulState } = state;
   return JSON.stringify(meaningfulState);
-}
-
-export function isAgentActivityPublishingEnabled(value: string | null): boolean {
-  return isAgentActivityPublishingEnabledValue(value);
 }
 
 export function resolveAgentActivityPublishingStartupState(input: {
@@ -207,7 +206,7 @@ const makePublishProof = Effect.fn("makePublishProof")(function* (input: {
 });
 
 // Compact, log-safe view of the fields the awareness phase ladder reads.
-export function describeThreadShellForAwareness(
+function describeThreadShellForAwareness(
   thread: Option.Option<OrchestrationThreadShell>,
 ): Record<string, unknown> {
   if (Option.isNone(thread)) {
@@ -286,6 +285,7 @@ export function resolveAgentAwarenessRelayActiveThreadIds(input: {
     .map((thread) => thread.id);
 }
 
+/** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
@@ -317,7 +317,7 @@ export const make = Effect.gen(function* () {
   });
 
   const readPublishAgentActivityEnabled = readSecretString(PUBLISH_AGENT_ACTIVITY_SECRET).pipe(
-    Effect.map(isAgentActivityPublishingEnabled),
+    Effect.map(isAgentActivityPublishingEnabledValue),
   );
 
   const makeRelayClient = (relayConfig: {
